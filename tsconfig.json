@@ -44,5 +44,7 @@
     "moduleResolution": "nodenext",
     "esModuleInterop": true,
     "resolveJsonModule": true,
-  }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "tests"]
 }

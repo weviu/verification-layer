@@ -69,8 +69,7 @@ export const SubmissionEntrySchema = z.object({
     ),
 
   merkleProof: z
-    .array(bytes32Hex)
-    .min(1, "merkleProof must contain at least one hash"),
+    .array(bytes32Hex),
 });
 
 // --- Metadata schemas ---
@@ -132,10 +131,13 @@ export const SubmissionMetadataSchema = z.object({
  * Fields:
  *   - electionId: bytes32 hex identifying the election
  *   - roundId: integer round number (>= 1)
- *   - merkleRoot: bytes32 hex of the claimed Merkle root
  *   - zkProof: hex-encoded zero-knowledge proof
  *   - submissions: array of per-node submission entries
  *   - metadata: round metadata including signatures and timestamp
+ *
+ * NOTE: Mixnet does NOT submit a Merkle root.
+ * The Verification Layer constructs the Merkle tree and derives
+ * the canonical Merkle root itself.
  */
 export const MixnetSubmissionSchema = z
   .object({
@@ -145,8 +147,6 @@ export const MixnetSubmissionSchema = z
       .number()
       .int("roundId must be an integer")
       .min(1, "roundId must be >= 1"),
-
-    merkleRoot: bytes32Hex,
 
     zkProof: z
       .string()

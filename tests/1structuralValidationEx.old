@@ -1,0 +1,28 @@
+curl -X POST http://localhost:3000/api/v1/submissions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "electionId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "roundId": 1,
+    "zkProof": "0xcccc",
+    "submissions": [
+      {
+        "nodeId": "node-0",
+        "encryptedVote": "0xdddd",
+        "tracker": "0xeeee",
+        "merkleProof": []
+      }
+],
+    "metadata": {
+      "nodeSignatures": [
+        {"nodeId": "node-0", "signature": "0xaaaa"}
+      ],
+      "version": "mixnet-1.0",
+      "timestamp": "2026-01-01T12:00:00Z"
+    }
+  }'
+
+## RESULT
+
+{"success":true,"message":"Round verified successfully. Ready for blockchain commitment.",
+"data":{"electionId":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","roundId":1,
+"derivedMerkleRoot":"0x6985de2fcde183f94afbef8f090eee919f2dc81b3468bfa081edcfcaaa14ee00","submissionCount":1}}

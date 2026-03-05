@@ -4,26 +4,45 @@
  * Exposes a single, explicit REST API endpoint for Mixnet submissions.
  * This is the ONLY entry point for data into the Verification Layer.
  *
- * Phase 1: Structural validation only.
- *   - Accepts POST /api/v1/submissions
+ * Phase 1: Structural validation
  *   - Validates input structure against strict schema
- *   - Returns validated input objects (or explicit errors)
- *   - Does NOT verify Merkle roots, ZK proofs, or submit to blockchain
+ *
+ * Phase 2: Cryptographic & logical verification
+ *   - Canonical ordering, Merkle tree construction, proof verification
+ *   - ZK proof verification (stub: fail-closed or passthrough via VL_ZK_MODE)
+ *   - Node-level checks, replay prevention
  */
 
 import express, { type Request, type Response, type NextFunction, type Express } from "express";
 import { validateSubmission } from "./validation/structural.js";
+import { VerificationPipeline } from "./verification/pipeline.js";
+import { createZkVerifier } from "./verification/zkVerifier.js";
+import { ReplayPreventionStore } from "./store/replayStore.js";
 import { logger } from "./logger/index.js";
 
 // --- Configuration ---
 
 const PORT = parseInt(process.env.VL_PORT ?? "3000", 10);
 const HOST = process.env.VL_HOST ?? "0.0.0.0";
+const ZK_MODE = process.env.VL_ZK_MODE ?? "strict";
+// TODO: Remove VL_ACCEPT_EMPTY_PROOFS once Mixnet produces Merkle proofs
+const ACCEPT_EMPTY_PROOFS = process.env.VL_ACCEPT_EMPTY_PROOFS === "true";
 
 if (Number.isNaN(PORT) || PORT < 1 || PORT > 65535) {
   logger.error("Invalid port configuration", { port: process.env.VL_PORT });
   process.exit(1);
 }
+
+// --- Initialize Phase 2 components ---
+
+const replayStore = new ReplayPreventionStore();
+const zkVerifier = createZkVerifier();
+const verificationPipeline = new VerificationPipeline(replayStore, zkVerifier, ACCEPT_EMPTY_PROOFS);
+
+logger.info("Phase 2 components initialized", {
+  zkMode: ZK_MODE,
+  acceptEmptyProofs: ACCEPT_EMPTY_PROOFS,
+});
 
 // --- Express App ---
 
@@ -55,7 +74,12 @@ app.use((err: unknown, _req: Request, res: Response, next: NextFunction): void =
 // --- Health check ---
 
 app.get("/health", (_req: Request, res: Response): void => {
-  res.status(200).json({ status: "ok", phase: 1 });
+  res.status(200).json({
+    status: "ok",
+    phase: 2,
+    zkMode: ZK_MODE,
+    acceptEmptyProofs: ACCEPT_EMPTY_PROOFS,
+  });
 });
 
 // --- Submission endpoint ---
@@ -63,14 +87,19 @@ app.get("/health", (_req: Request, res: Response): void => {
 /**
  * POST /api/v1/submissions
  *
- * Accepts a Mixnet round submission, performs structural validation,
- * and returns either:
- *   - 200 with the validated data (ready for Phase 2 verification)
- *   - 400 with detailed validation errors
+ * Accepts a Mixnet round submission, performs:
+ *   Phase 1: Structural validation
+ *   Phase 2: Cryptographic & logical verification
+ *
+ * Returns:
+ *   - 200 with derived Merkle root on full verification success
+ *   - 400 on structural validation failure
+ *   - 422 on cryptographic verification failure
+ *   - 409 on replay (duplicate round)
  *
  * Content-Type must be application/json.
  */
-app.post("/api/v1/submissions", (req: Request, res: Response): void => {
+app.post("/api/v1/submissions", async (req: Request, res: Response): Promise<void> => {
   logger.info("Received submission request", {
     contentType: req.headers["content-type"],
     ip: req.ip,
@@ -90,38 +119,77 @@ app.post("/api/v1/submissions", (req: Request, res: Response): void => {
 
   const body: unknown = req.body;
 
-  const result = validateSubmission(body);
+  // --- Phase 1: Structural validation ---
+  const structuralResult = validateSubmission(body);
 
-  if (result.valid) {
-    logger.info("Submission accepted (structural validation passed)", {
-      electionId: result.data.electionId,
-      roundId: result.data.roundId,
+  if (!structuralResult.valid) {
+    logger.warn("Submission rejected (structural validation failed)", {
+      errorCount: structuralResult.errors.length,
     });
 
-    res.status(200).json({
-      success: true,
-      message: "Structural validation passed. Ready for cryptographic verification.",
-      data: {
-        electionId: result.data.electionId,
-        roundId: result.data.roundId,
-        merkleRoot: result.data.merkleRoot,
-        submissionCount: result.data.submissions.length,
-      },
+    res.status(400).json({
+      success: false,
+      error: "STRUCTURAL_VALIDATION_FAILED",
+      message: "Submission failed structural validation. See errors for details.",
+      errors: structuralResult.errors,
     });
     return;
   }
 
-  // Validation failed: return all errors explicitly
-  logger.warn("Submission rejected (structural validation failed)", {
-    errorCount: result.errors.length,
+  logger.info("Phase 1 passed, proceeding to Phase 2", {
+    electionId: structuralResult.data.electionId,
+    roundId: structuralResult.data.roundId,
   });
 
-  res.status(400).json({
-    success: false,
-    error: "STRUCTURAL_VALIDATION_FAILED",
-    message: "Submission failed structural validation. See errors for details.",
-    errors: result.errors,
-  });
+  // --- Phase 2: Cryptographic & logical verification ---
+  try {
+    const verificationResult = await verificationPipeline.verify(structuralResult.data);
+
+    if (verificationResult.verified) {
+      const hasWarnings = verificationResult.warnings.length > 0;
+      const responseBody: Record<string, unknown> = {
+        success: true,
+        message: hasWarnings
+          ? "Round verified successfully (Merkle proofs bypassed in development mode)."
+          : "Round verified successfully. Ready for blockchain commitment.",
+        data: {
+          electionId: verificationResult.electionId,
+          roundId: verificationResult.roundId,
+          derivedMerkleRoot: verificationResult.derivedMerkleRoot,
+          submissionCount: verificationResult.submissionCount,
+        },
+      };
+
+      if (hasWarnings) {
+        responseBody.warnings = verificationResult.warnings;
+      }
+
+      res.status(200).json(responseBody);
+      return;
+    }
+
+    // Verification failed: determine appropriate HTTP status
+    const httpStatus = verificationResult.step === "REPLAY_PREVENTION" ? 409 : 422;
+
+    res.status(httpStatus).json({
+      success: false,
+      error: "VERIFICATION_FAILED",
+      step: verificationResult.step,
+      message: verificationResult.reason,
+    });
+  } catch (err) {
+    logger.error("Unexpected error during verification pipeline", {
+      error: err instanceof Error ? err.message : String(err),
+      electionId: structuralResult.data.electionId,
+      roundId: structuralResult.data.roundId,
+    });
+
+    res.status(500).json({
+      success: false,
+      error: "VERIFICATION_INTERNAL_ERROR",
+      message: "An unexpected error occurred during verification",
+    });
+  }
 });
 
 // --- Catch-all for unknown routes ---
@@ -154,7 +222,8 @@ app.listen(PORT, HOST, () => {
   logger.info(`Verification Layer started`, {
     host: HOST,
     port: PORT,
-    phase: 1,
+    phase: 2,
+    zkMode: ZK_MODE,
   });
   logger.info("Endpoints available:", {
     health: "GET /health",
